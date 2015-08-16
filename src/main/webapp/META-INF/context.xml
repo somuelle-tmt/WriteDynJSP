@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Context antiJARLocking="true" path="/writedynjsp">
+  <ResourceLink global="jdbc/MyDatabase" name="jdbc/MyDatabase" type="javax.sql.DataSource"/>
+</Context>
