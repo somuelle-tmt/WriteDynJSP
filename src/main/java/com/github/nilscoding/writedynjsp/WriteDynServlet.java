@@ -7,10 +7,17 @@ import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.Date;
+import javax.naming.Context;
+import javax.naming.InitialContext;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import javax.sql.DataSource;
 
 /**
  * Servlet to write JSP from database to filesystem and forward request
@@ -39,7 +46,8 @@ public class WriteDynServlet extends HttpServlet {
             response.sendError(HttpServletResponse.SC_NOT_FOUND);
             return;
         }
-        Connection conn = DatabaseUtils.getDatabaseConnection(cfgDbSourceName);
+        String cfgReqPathMapping = this.getInitParameter("req.pattern");
+        Connection conn = getDatabaseConnection(cfgDbSourceName);
         
         if (conn == null) {
             // send 404 if no database connection is available
@@ -56,20 +64,38 @@ public class WriteDynServlet extends HttpServlet {
         String tmpPath = contextPath + servletPath;
         if (requestUri.startsWith(tmpPath) == false) {
             // something went wrong with the path
-            DatabaseUtils.close(conn);
+            close(conn);
             response.sendError(HttpServletResponse.SC_NOT_FOUND);
             return;
         }
         
-        String requestedFilename = requestUri.substring(tmpPath.length() + 1); // plus 1 to remove / at beginning
+        String pageIncludedAs = (String)request.getAttribute("page_included_as");
+        String requestedFilename = null;
+        if (StringUtils.isEmpty(pageIncludedAs, true) == false) {
+            //System.out.println("included as: " + pageIncludedAs);
+            requestedFilename = pageIncludedAs;
+        } else if (requestUri.length() >= tmpPath.length() + 1) {
+            requestedFilename = requestUri.substring(tmpPath.length() + 1); // plus 1 to remove / at beginning
+            //System.out.println("via request uri: " + requestedFilename);
+        } else {
+            close(conn);
+            response.sendError(HttpServletResponse.SC_NOT_FOUND);
+            return;
+        }
         
         // get jsp data from database
         //   statement is expected to return the data in following order with bind parameter on filename
         //   - filename: String
         //   - jsp data: String
         //   - last change: Date
-        JspFileEntry jspEntry = DatabaseUtils.readJspFileEntryFromDatabase(conn, cfgDbStatement, requestedFilename);
-        DatabaseUtils.close(conn);
+        if (StringUtils.isEmpty(cfgReqPathMapping, true) == false) {
+            String tmpReqFilename = StringUtils.findRegexGroup(requestedFilename, cfgReqPathMapping, 1);
+            if (StringUtils.isEmpty(tmpReqFilename, true) == false) {
+                requestedFilename = tmpReqFilename;
+            }
+        }
+        JspFileEntry jspEntry = readJspFileEntryFromDatabase(conn, cfgDbStatement, requestedFilename);
+        close(conn);
         
         if (jspEntry == null) {
             response.sendError(HttpServletResponse.SC_NOT_FOUND);
@@ -77,7 +103,7 @@ public class WriteDynServlet extends HttpServlet {
         }
         
         // this is the path to the temporary jsp folder
-        String completeTempPath = request.getServletContext().getRealPath(cfgTempPath);
+        String completeTempPath = this.getServletContext().getRealPath(cfgTempPath);
         if (StringUtils.isEmpty(completeTempPath)) {
             response.sendError(HttpServletResponse.SC_NOT_FOUND);
             return;
@@ -126,7 +152,8 @@ public class WriteDynServlet extends HttpServlet {
         
         // forward internally to jsp file
         String targetUri = "/" + cfgTempPath + jspFilename;
-        request.getRequestDispatcher(targetUri).forward(request, response);
+//        request.getRequestDispatcher(targetUri).forward(request, response);
+        request.getRequestDispatcher(targetUri).include(request, response);
         
     }
 
@@ -169,4 +196,99 @@ public class WriteDynServlet extends HttpServlet {
         return "WriteDynServlet";
     }// </editor-fold>
 
+    /**
+     * Returns a named JDBC connection from container
+     * @param name  connection name, e.g. "jdbc/MyDatabase"
+     * @return  database connection or null on error
+     */
+    public static Connection getDatabaseConnection(String name) {
+        try {
+            Context initContext = new InitialContext();
+            Context envContext = (Context) initContext.lookup("java:comp/env");
+            DataSource ds = (DataSource) envContext.lookup(name);
+            Connection conn = ds.getConnection();
+            return conn;
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+    
+    /**
+     * Silently closes a statement
+     * @param stmt  statement to close
+     */
+    public static void close(Statement stmt) {
+        if (stmt == null) {
+            return;
+        }
+        try {
+            stmt.close();
+        } catch (Exception ex) {
+        }
+    }
+
+    /**
+     * Silently closes a result set
+     * @param rs    result set to close
+     */
+    public static void close(ResultSet rs) {
+        if (rs == null) {
+            return;
+        }
+        try {
+            rs.close();
+        } catch (Exception ex) {
+        }
+    }
+    
+    /**
+     * Silently closes a connection
+     * @param conn  connection to close
+     */
+    public static void close(Connection conn) {
+        if (conn == null) {
+            return;
+        }
+        try {
+            conn.close();
+        } catch (Exception ex) {
+        }
+    }
+    
+    /**
+     * Reads the JSP file entry from database
+     * @param conn  database connection
+     * @param stmt  select statement
+     * @param filename  filename
+     * @return jsp entry or null if not found
+     */
+    public static JspFileEntry readJspFileEntryFromDatabase(Connection conn, String stmt, String filename) {
+        JspFileEntry jspEntry = null;
+        PreparedStatement pStmt = null;
+        ResultSet rs = null;
+        try {
+            pStmt = conn.prepareStatement(stmt);
+            pStmt.setString(1, filename);
+            rs = pStmt.executeQuery();
+            if (rs.next()) {
+                jspEntry = new JspFileEntry();
+                jspEntry.setFilename(rs.getString(1));
+                jspEntry.setFiledata(rs.getString(2));
+                Object dateObj = rs.getObject(3);
+                if (dateObj instanceof java.sql.Timestamp) {
+                    jspEntry.setFiledate(new Date(((java.sql.Timestamp)dateObj).getTime()));
+                } else if (dateObj instanceof Number) {
+                    jspEntry.setFiledate(new Date(((Number)dateObj).longValue()));
+                } else {
+                    jspEntry.setFiledate(new Date());
+                }
+            }
+        } catch (Exception ex) {
+            jspEntry = null;
+        }
+        close(pStmt);
+        close(rs);
+        return jspEntry;
+    }
+    
 }
